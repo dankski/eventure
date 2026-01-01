@@ -1,28 +1,30 @@
 package ports
 
 import (
+	"database/sql"
 	"log"
 
 	"eventure/libs/events"
 
-	. "eventure/services/orders/internal/domain/order"
+	status "eventure/services/orders/internal/domain/order"
+	"eventure/services/orders/internal/ports/outbox"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 )
 
 type OrderService struct {
-	nc    *nats.Conn
-	store *Store
+	db     *sql.DB
+	repo   *Repository
+	outbox *outbox.Repository
 }
 
-func NewOrderService(nc *nats.Conn, store *Store) *OrderService {
-	return &OrderService{nc: nc, store: store}
+func NewOrderService(db *sql.DB, repo *Repository, outbox *outbox.Repository) *OrderService {
+	return &OrderService{db: db, repo: repo, outbox: outbox}
 }
 
 func (o *OrderService) CreateOrder(itemID string, qty int) (string, error) {
 	orderID := uuid.NewString()
-	o.store.SetStatus(orderID, StatusNew)
 
 	evt := events.OrderCreated{
 		OrderID: orderID,
@@ -31,42 +33,136 @@ func (o *OrderService) CreateOrder(itemID string, qty int) (string, error) {
 	}
 
 	data, _ := events.Marshal(evt)
+
+	tx, err := o.db.Begin()
+	if err != nil {
+		return "", err
+	}
+
+	err = o.repo.CreateTx(tx, orderID, status.StatusNew)
+	if err != nil {
+		tx.Rollback()
+		return "", err
+	}
+
+	err = o.outbox.InsertTx(tx, orderID, "order.created", data)
+	if err != nil {
+		tx.Rollback()
+		return "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+
 	log.Printf("OrderService: created order %s", orderID)
-	o.nc.Publish("order.created", data)
 
 	return orderID, nil
 }
 
-func (o *OrderService) StartSagaListeners() {
+func (o *OrderService) StartSagaListeners(nc *nats.Conn) {
 
-	o.nc.Subscribe("inventory.reserved", func(msg *nats.Msg) {
-		evt, _ := events.UnmarshalInventoryReserved(msg.Data)
-		log.Printf("OrderService: invetory for order %s", evt.OrderID)
-		o.store.SetStatus(evt.OrderID, StatusReserved)
+	nc.Subscribe("inventory.reserved", func(msg *nats.Msg) {
+		evt, err := events.UnmarshalInventoryReserved(msg.Data)
+		if err != nil {
+			log.Println("failed to unmarshal inventory.reserved event:", err)
+			return
+		}
+
+		tx, err := o.db.Begin()
+		if err != nil {
+			log.Println("failed to begin transaction:", err)
+			return
+		}
+
+		err = o.repo.UpdateStatusTx(tx, evt.OrderID, status.StatusReserved)
+		if err != nil {
+			tx.Rollback()
+			log.Println("failed to update order status:", err)
+			return
+		}
 
 		evtPaymentCharge := events.PaymentCharge{OrderID: evt.OrderID}
 		data, _ := events.Marshal(evtPaymentCharge)
-		o.nc.Publish("payment.charge", data) // trigger payment service
+
+		err = o.outbox.InsertTx(tx, evt.OrderID, "payment.charge", data)
+		if err != nil {
+			tx.Rollback()
+			log.Println("failed to insert outbox record:", err)
+			return
+		}
+
+		tx.Commit()
+		log.Printf("OrderService: inventory reserved for order %s", evt.OrderID)
 	})
 
 	// inventory failed -> cancel
-	o.nc.Subscribe("inventory.failed", func(msg *nats.Msg) {
-		evt, _ := events.UnmarshalInventoryFailed(msg.Data)
-		log.Printf("OrderService: invetory faield for order: %s: %s", evt.OrderID, evt.Reason)
-		o.store.SetStatus(evt.OrderID, StatusCancelled)
+	nc.Subscribe("inventory.failed", func(msg *nats.Msg) {
+		evt, err := events.UnmarshalInventoryFailed(msg.Data)
+		if err != nil {
+			log.Println("failed to unmarshal inventory.failed event:", err)
+			return
+		}
+
+		tx, err := o.db.Begin()
+		if err != nil {
+			log.Println("failed to begin transaction:", err)
+			return
+		}
+
+		if err := o.repo.UpdateStatusTx(tx, evt.OrderID, status.StatusCancelled); err != nil {
+			tx.Rollback()
+			log.Println("failed to update order status:", err)
+			return
+		}
+
+		tx.Commit()
 	})
 
 	// payment authorized -> complete order
-	o.nc.Subscribe("payment.authorize", func(msg *nats.Msg) {
-		evt, _ := events.UnmarshalPaymentAuthorized(msg.Data)
+	nc.Subscribe("payment.authorize", func(msg *nats.Msg) {
+		evt, err := events.UnmarshalPaymentAuthorized(msg.Data)
+		if err != nil {
+			log.Println("failed to unmarshal payment.authorize event:", err)
+			return
+		}
+
+		tx, err := o.db.Begin()
+		if err != nil {
+			log.Println("failed to begin transaction:", err)
+			return
+		}
+
+		if err := o.repo.UpdateStatusTx(tx, evt.OrderID, status.StatusCompleted); err != nil {
+			tx.Rollback()
+			log.Println("failed to update order status:", err)
+			return
+		}
+
+		tx.Commit()
 		log.Printf("OrderService: payment authorized for order %s", evt.OrderID)
-		o.store.SetStatus(evt.OrderID, StatusCompleted)
 	})
 
 	// payment failed -> cancel
-	o.nc.Subscribe("payment.failed", func(msg *nats.Msg) {
-		evt, _ := events.UnmarshalPaymentFailed(msg.Data)
-		log.Printf("OrderService: payment failed for order %s: %s", evt.OrderID, evt.Reason)
-		o.store.SetStatus(evt.OrderID, StatusCancelled)
+	nc.Subscribe("payment.failed", func(msg *nats.Msg) {
+		evt, err := events.UnmarshalPaymentFailed(msg.Data)
+		if err != nil {
+			log.Println("failed to unmarshal payment.failed event:", err)
+			return
+		}
+
+		tx, err := o.db.Begin()
+		if err != nil {
+			log.Println("failed to begin transaction:", err)
+			return
+		}
+
+		if err := o.repo.UpdateStatusTx(tx, evt.OrderID, status.StatusCancelled); err != nil {
+			tx.Rollback()
+			log.Println("failed to update order status:", err)
+			return
+		}
+		tx.Commit()
+		log.Printf("OrderService: payment failed for order %s", evt.OrderID)
 	})
 }
