@@ -14,21 +14,13 @@ func main() {
 	nc := nss.ConnectNATS()
 	defer nc.Close()
 
-	handler := ports.NewInventoryHandler()
+	handler := ports.NewInventoryHandler(nc)
 
-	_, err := nc.Subscribe("order.created", func(msg *nats.Msg) {
-		evt, err := events.UnmarshalOrderCreated(msg.Data)
-		if err != nil {
-			log.Println("error:", err)
-			return
-		}
-
+	_, _ = nc.Subscribe("order.created", func(msg *nats.Msg) {
+		evt, _ := events.UnmarshalOrderCreated(msg.Data)
 		handler.Handle(evt)
 	})
-	if err != nil {
-		log.Fatalf("Subscribe failed: %v", err)
-	}
 
-	log.Println("Inventory serivce running... listening to order.created")
+	log.Println("Inventory serivce running...")
 	select {}
 }
