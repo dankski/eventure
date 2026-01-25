@@ -1,2 +1,3 @@
 # eventure
-Learning service patterns project
+
+Learning orchestration pattern.
